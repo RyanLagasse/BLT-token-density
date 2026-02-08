@@ -1,0 +1,4 @@
+pass.txt
+.env
+*.key
+*.pem
