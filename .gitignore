@@ -2,3 +2,6 @@ pass.txt
 .env
 *.key
 *.pem
+blt-1b/
+blt-7b/
+
