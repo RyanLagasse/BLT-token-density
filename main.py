@@ -6,14 +6,13 @@ Loads the BLT entropy model (patcher) from the entropy_model/ subdirectory,
 varies the entropy patching threshold, counts and prints byte patches.
 
 The entropy model is a small byte-level causal LM (LLaMA-architecture).
-The checkpoint uses Meta naming conventions (attention.wq, feed_forward.w1, etc.)
-which must be mapped to HF naming (self_attn.q_proj, mlp.gate_proj, etc.).
+Weights are in Meta .pth format with Meta key naming; we map them to HF
+LlamaForCausalLM conventions and build a standalone model for inference.
 """
 
 import json
 import torch
 from pathlib import Path
-from safetensors.torch import load_file as load_safetensors
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -25,7 +24,7 @@ SAMPLE_TEXT = (
     "Photosynthesis converts sunlight into chemical energy."
 )
 
-THRESHOLDS = [0.1, 0.3, 0.5, 0.7, 0.9, 1.2, 1.5, 2.0]
+THRESHOLDS = [7.75, 7.775, 7.8, 7.825, 7.85, 7.9]
 
 MODEL_DIRS = {
     "blt-1b": Path("blt-1b"),
@@ -36,6 +35,12 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 # ---------------------------------------------------------------------------
 # Meta -> HF weight key mapping
+#
+# Raw checkpoint keys have model. prefix and Meta naming:
+#   model.layers.0.attention.wq.weight
+#   model.tok_embeddings.weight
+#   model.output.weight
+#   model.norm.weight
 # ---------------------------------------------------------------------------
 
 _KEY_REPLACEMENTS = [
@@ -56,9 +61,11 @@ def _map_meta_key(key: str) -> str:
     """Map a Meta-format weight key to HF LlamaForCausalLM naming."""
     for old, new in _KEY_REPLACEMENTS:
         key = key.replace(old, new)
-    if key == "output.weight":
+    # model.output.weight -> lm_head.weight (top-level head, outside model.)
+    if key in ("model.output.weight", "output.weight"):
         return "lm_head.weight"
-    if not key.startswith("lm_head"):
+    # Only add model. prefix if not already present
+    if not key.startswith("model.") and not key.startswith("lm_head"):
         key = "model." + key
     return key
 
@@ -67,7 +74,7 @@ def _map_meta_key(key: str) -> str:
 # ---------------------------------------------------------------------------
 
 def read_patching_config(model_dir: Path) -> dict:
-    """Read patching-related fields from the main model config."""
+    """Read patching-related fields from the main model config.json."""
     cfg = json.loads((model_dir / "config.json").read_text())
     return {
         "patching_mode": cfg.get("patching_mode", "entropy"),
@@ -76,120 +83,69 @@ def read_patching_config(model_dir: Path) -> dict:
     }
 
 
-def _load_raw_weights(directory: Path) -> dict:
-    """Load weights from safetensors (preferred) or .bin files."""
-    weights = {}
-    for sf in sorted(directory.glob("*.safetensors")):
-        weights.update(load_safetensors(str(sf)))
-    if not weights:
-        for bf in sorted(directory.glob("*.bin")):
-            weights.update(torch.load(str(bf), map_location="cpu", weights_only=True))
-    if not weights:
-        raise FileNotFoundError(f"No weight files found in {directory}")
-    return weights
-
-
-def _infer_llama_config(entropy_dir: Path, raw_weights: dict):
-    """Build a LlamaConfig from the entropy model config.json + weight shapes."""
-    from transformers import LlamaConfig
-
-    cfg_path = entropy_dir / "config.json"
-    cfg = json.loads(cfg_path.read_text()) if cfg_path.exists() else {}
-
-    # Determine hidden size from embedding weight shape
-    emb_key = next((k for k in raw_weights if "tok_embeddings" in k or "embed_tokens" in k), None)
-    if emb_key is not None:
-        vocab_size_w, hidden_size_w = raw_weights[emb_key].shape
-    else:
-        vocab_size_w, hidden_size_w = None, None
-
-    # Count layers from weight keys
-    layer_indices = [
-        int(k.split(".")[1])
-        for k in raw_weights
-        if k.startswith("layers.")
-    ]
-    n_layers_w = max(layer_indices) + 1 if layer_indices else None
-
-    # Config values with fallbacks: config.json (Meta names) -> config.json (HF names) -> weight shapes
-    hidden_size = cfg.get("dim", cfg.get("hidden_size", hidden_size_w or 512))
-    n_layers = cfg.get("n_layers", cfg.get("num_hidden_layers", n_layers_w or 14))
-    n_heads = cfg.get("n_heads", cfg.get("num_attention_heads", 8))
-    n_kv_heads = cfg.get("n_kv_heads", cfg.get("num_key_value_heads", n_heads))
-    vocab_size = cfg.get("vocab_size", vocab_size_w or 260)
-
-    # Intermediate size: check config, else infer from weight shape
-    ffn_key = next((k for k in raw_weights if "feed_forward.w1" in k or "mlp.gate_proj" in k), None)
-    if "hidden_dim" in cfg:
-        intermediate_size = cfg["hidden_dim"]
-    elif "intermediate_size" in cfg:
-        intermediate_size = cfg["intermediate_size"]
-    elif ffn_key is not None:
-        intermediate_size = raw_weights[ffn_key].shape[0]
-    else:
-        intermediate_size = int(hidden_size * 8 / 3)
-
-    return LlamaConfig(
-        hidden_size=hidden_size,
-        intermediate_size=intermediate_size,
-        num_hidden_layers=n_layers,
-        num_attention_heads=n_heads,
-        num_key_value_heads=n_kv_heads,
-        vocab_size=vocab_size,
-        max_position_embeddings=cfg.get("max_seq_len", cfg.get("max_position_embeddings", 8192)),
-        rms_norm_eps=cfg.get("norm_eps", cfg.get("rms_norm_eps", 1e-5)),
-        rope_theta=cfg.get("rope_theta", 500000.0),
-    )
-
-
 def load_entropy_model(model_dir: Path):
     """
     Load the entropy/patcher model from {model_dir}/entropy_model/.
 
-    Strategy:
-      1. Try direct AutoModel load (works if weights are already HF-formatted).
-      2. Fall back to building a LlamaForCausalLM and loading with Meta->HF key mapping.
+    Reads params.json for architecture config, loads consolidated.pth weights
+    with Meta->HF key mapping, builds a LlamaForCausalLM.
     """
-    from transformers import AutoModelForCausalLM, LlamaForCausalLM
+    from transformers import LlamaConfig, LlamaForCausalLM
 
     entropy_dir = model_dir / "entropy_model"
     if not entropy_dir.exists():
         raise FileNotFoundError(f"No entropy_model/ directory in {model_dir}")
 
-    # --- Approach 1: direct HF load ---
-    try:
-        m = AutoModelForCausalLM.from_pretrained(
-            entropy_dir, torch_dtype=torch.bfloat16, device_map=DEVICE,
-        )
-        m.eval()
-        print(f"  Entropy model loaded directly from {entropy_dir}")
-        return m
-    except Exception as e:
-        print(f"  Direct AutoModel load failed: {e}")
-        print("  Falling back to LlamaForCausalLM + key mapping ...")
+    # --- Read config from params.json ---
+    params = json.loads((entropy_dir / "params.json").read_text())
+    ecfg = params.get("entropy_model", params)
+    print(f"  Entropy model config: dim={ecfg['dim']}, layers={ecfg['n_layers']}, "
+          f"heads={ecfg['n_heads']}, vocab={ecfg['vocab_size']}")
 
-    # --- Approach 2: manual load with key mapping ---
-    raw_weights = _load_raw_weights(entropy_dir)
-    print(f"  Raw weight keys (sample): {list(raw_weights.keys())[:5]}")
+    # --- Load raw weights from consolidated.pth ---
+    pth_path = entropy_dir / "consolidated.pth"
+    if not pth_path.exists():
+        raise FileNotFoundError(f"No consolidated.pth in {entropy_dir}")
+    print(f"  Loading weights from {pth_path} ...")
+    raw = torch.load(str(pth_path), map_location="cpu", weights_only=True)
+    print(f"  Raw checkpoint: {len(raw)} keys")
 
-    llama_cfg = _infer_llama_config(entropy_dir, raw_weights)
-    print(f"  Inferred config: layers={llama_cfg.num_hidden_layers}, "
-          f"hidden={llama_cfg.hidden_size}, heads={llama_cfg.num_attention_heads}, "
-          f"vocab={llama_cfg.vocab_size}")
+    # --- Infer intermediate_size from weight shape ---
+    w1_key = next((k for k in raw if "feed_forward.w1" in k), None)
+    intermediate_size = raw[w1_key].shape[0] if w1_key else int(ecfg["dim"] * 8 / 3)
 
-    m = LlamaForCausalLM(llama_cfg)
-    mapped = {_map_meta_key(k): v for k, v in raw_weights.items()}
+    # --- Build LlamaForCausalLM ---
+    n_kv_heads = ecfg.get("n_kv_heads") or ecfg["n_heads"]  # null means same as n_heads
+    llama_cfg = LlamaConfig(
+        hidden_size=ecfg["dim"],
+        intermediate_size=intermediate_size,
+        num_hidden_layers=ecfg["n_layers"],
+        num_attention_heads=ecfg["n_heads"],
+        num_key_value_heads=n_kv_heads,
+        vocab_size=ecfg["vocab_size"],
+        max_position_embeddings=ecfg.get("max_seqlen", 8192),
+        rms_norm_eps=ecfg.get("norm_eps", 1e-5),
+        rope_theta=ecfg.get("rope_theta", 10000.0),
+    )
+    print(f"  LlamaConfig: hidden={llama_cfg.hidden_size}, intermediate={llama_cfg.intermediate_size}, "
+          f"layers={llama_cfg.num_hidden_layers}, heads={llama_cfg.num_attention_heads}, "
+          f"kv_heads={llama_cfg.num_key_value_heads}")
 
-    info = m.load_state_dict(mapped, strict=False)
+    model = LlamaForCausalLM(llama_cfg)
+
+    # --- Map keys and load ---
+    mapped = {_map_meta_key(k): v for k, v in raw.items()}
+    info = model.load_state_dict(mapped, strict=False)
     if info.missing_keys:
         print(f"  Missing keys ({len(info.missing_keys)}): {info.missing_keys[:5]}")
     if info.unexpected_keys:
         print(f"  Unexpected keys ({len(info.unexpected_keys)}): {info.unexpected_keys[:5]}")
+    if not info.missing_keys and not info.unexpected_keys:
+        print("  All weights loaded successfully!")
 
-    m = m.to(dtype=torch.bfloat16, device=DEVICE)
-    m.eval()
-    print("  Entropy model loaded via LlamaForCausalLM + key mapping")
-    return m
+    model = model.to(dtype=torch.bfloat16, device=DEVICE)
+    model.eval()
+    return model
 
 # ---------------------------------------------------------------------------
 # Entropy computation & patching
@@ -206,7 +162,7 @@ def compute_byte_entropies(entropy_model, byte_ids: list[int]) -> list[float]:
     input_ids = torch.tensor([byte_ids], dtype=torch.long, device=DEVICE)
     with torch.no_grad():
         output = entropy_model(input_ids)
-        logits = output.logits if hasattr(output, "logits") else output[0]
+        logits = output.logits
 
     # (seq_len, vocab_size) -- use float32 for numerical stability
     probs = torch.softmax(logits[0].float(), dim=-1)
